@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
+#include <sys/random.h>
 #include <sys/select.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
@@ -702,6 +703,35 @@ uint32_t InitPropertySet(const std::string& name, const std::string& value) {
     return result;
 }
 
+static uint32_t InitPropertyForceSet(const std::string& name, const std::string& value) {
+    if (!IsLegalPropertyName(name)) {
+        LOG(ERROR) << "Init cannot force-set '" << name << "': Illegal property name";
+        return PROP_ERROR_INVALID_NAME;
+    }
+
+    if (auto result = IsLegalPropertyValue(name, value); !result.ok()) {
+        LOG(ERROR) << "Init cannot force-set '" << name << "' to '" << value
+                   << "': " << result.error().message();
+        return PROP_ERROR_INVALID_VALUE;
+    }
+
+    size_t valuelen = value.size();
+    prop_info* pi = (prop_info*)__system_property_find(name.c_str());
+    if (pi != nullptr) {
+        __system_property_update(pi, value.c_str(), valuelen);
+    } else {
+        int rc = __system_property_add(name.c_str(), name.size(), value.c_str(), valuelen);
+        if (rc < 0) {
+            LOG(ERROR) << "Init cannot force-set '" << name << "' to '" << value
+                       << "': __system_property_add failed";
+            return PROP_ERROR_SET_FAILED;
+        }
+    }
+
+    NotifyPropertyChange(name, value);
+    return PROP_SUCCESS;
+}
+
 static Result<void> load_properties_from_file(const char*, const char*,
                                               std::map<std::string, std::string>*);
 
@@ -1153,11 +1183,6 @@ static void SetSafetyNetProps() {
     uint32_t res;
 
     const std::pair<const char*, const char*> props[] = {
-        {"ro.boot.flash.locked", "1"},
-        {"ro.boot.vbmeta.device_state", "locked"},
-        {"ro.boot.verifiedbootstate", "green"},
-        {"ro.boot.veritymode", "enforcing"},
-        {"ro.boot.warranty_bit", "0"},
         {"ro.warranty_bit", "0"},
         {"ro.debuggable", "0"},
         {"ro.force.debuggable", "0"},
@@ -1183,7 +1208,6 @@ static void SetSafetyNetProps() {
         {"sys.oem_unlock_allowed", "0"},
         {"ro.oem_unlock_supported", "0"},
         {"ro.crypto.state", "encrypted"},
-        {"ro.boot.flash.locked", "1"},
         {"ro.is_ever_orange", "0"},
         {"ro.secureboot.devicelock", "1"},
         {"ro.secureboot.lockstate", "locked"}
@@ -1305,10 +1329,6 @@ void PropertyLoadBootDefaults() {
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
 
-    // Report a valid verified boot chain to make Google SafetyNet integrity
-    // checks pass. This needs to be done before parsing the kernel cmdline as
-    // these properties are read-only and will be set to invalid values with
-    // androidboot cmdline arguments.
     if (SPOOF_SAFETYNET) {
       if (!IsRecoveryMode()) {
         SetSafetyNetProps();
@@ -1476,6 +1496,33 @@ static void ProcessBootconfig() {
     });
 }
 
+static std::string GenerateSpoofedBootDigest() {
+    static constexpr char kHex[] = "0123456789abcdef";
+    uint8_t digest[32];
+    if (TEMP_FAILURE_RETRY(getrandom(digest, sizeof(digest), 0)) != sizeof(digest)) {
+        PLOG(FATAL) << "getrandom failed for spoofed vbmeta digest";
+    }
+
+    std::string hex(sizeof(digest) * 2, '\0');
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        hex[i * 2] = kHex[digest[i] >> 4];
+        hex[i * 2 + 1] = kHex[digest[i] & 0x0f];
+    }
+    return hex;
+}
+
+// ro.boot.* is write-once, so publish these before bootconfig and kernel cmdline
+// import. Framework attestation reads the digest properties from here.
+static void SetVerifiedBootProps() {
+    InitPropertyForceSet("ro.boot.flash.locked", "1");
+    InitPropertyForceSet("ro.boot.vbmeta.digest", GenerateSpoofedBootDigest());
+    InitPropertyForceSet("ro.boot.vbmeta.public_key_digest", GenerateSpoofedBootDigest());
+    InitPropertyForceSet("ro.boot.vbmeta.device_state", "locked");
+    InitPropertyForceSet("ro.boot.verifiedbootstate", "green");
+    InitPropertyForceSet("ro.boot.veritymode", "enforcing");
+    InitPropertyForceSet("ro.boot.warranty_bit", "0");
+}
+
 void PropertyInit() {
     selinux_callback cb;
     cb.func_audit = PropertyAuditCallback;
@@ -1488,6 +1535,10 @@ void PropertyInit() {
     }
     if (!property_info_area.LoadDefaultPath()) {
         LOG(FATAL) << "Failed to load serialized property info file";
+    }
+
+    if (!IsRecoveryMode()) {
+        SetVerifiedBootProps();
     }
 
     // If arguments are passed both on the command line and in DT,
