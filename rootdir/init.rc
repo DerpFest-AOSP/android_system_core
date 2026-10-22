@@ -763,6 +763,11 @@ on post-fs-data
     # before starting apexd.
     # /data/property should be created before `load_persist_props`
     mkdir /data/property 0700 root root encryption=Require
+    # Root modules that rewrite this file (e.g. resetprop -p) can leave it
+    # group/world-writable; init then skips it and every persist.* prop,
+    # including the timezone, is lost at boot.
+    chown root root /data/property/persistent_properties
+    chmod 0600 /data/property/persistent_properties
     load_persist_props
 
     start logd-reinit
