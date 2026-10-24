@@ -28,9 +28,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
-#include <sys/random.h>
 #include <sys/select.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
@@ -38,6 +39,7 @@
 #include <unistd.h>
 #include <wchar.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -400,8 +402,10 @@ static std::optional<uint32_t> PropertySet(const std::string& name, const std::s
     } else {
         prop_info* pi = (prop_info*)__system_property_find(name.c_str());
         if (pi != nullptr) {
-            // ro.* properties are actually "write-once", unless the system decides to
-            if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
+            // ro.* properties are actually "write-once", unless the system decides to.
+            // ro.boot.vbmeta.* stays replaceable so a later measurement can correct it.
+            if (StartsWith(name, "ro.") && !weaken_prop_override_security &&
+                !StartsWith(name, "ro.boot.vbmeta.")) {
                 *error = "Read-only property was already set";
                 return {PROP_ERROR_READ_ONLY_PROPERTY};
             }
@@ -498,6 +502,20 @@ bool CheckControlPropertyPerms(const std::string& name, const std::string& value
     return CheckMacPerms(control_string_full, target_context_full, source_context.c_str(), cr);
 }
 
+static bool is_exempt(const std::string& name, const std::string& source_context) {
+    static const std::vector<std::string> exemption_list = {
+            "persist.sys.",
+            "logpersistd",
+            "ro.boot.vbmeta.",
+    };
+
+    return std::any_of(exemption_list.begin(), exemption_list.end(),
+            [&](const std::string& exempt) {
+                return name.find(exempt) != std::string::npos ||
+                        source_context.find(exempt) != std::string::npos;
+            });
+}
+
 // This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
 uint32_t CheckPermissions(const std::string& name, const std::string& value,
                           const std::string& source_context, const ucred& cr, std::string* error) {
@@ -520,7 +538,8 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     const char* type = nullptr;
     property_info_area->GetPropertyInfo(name.c_str(), &target_context, &type);
 
-    if (!CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
+    if (!is_exempt(name, source_context) &&
+        !CheckMacPerms(name, target_context, source_context.c_str(), cr)) {
         // Info about contexts are available also in the selinux denials in the kernel message,
         // but they may be suppressed by the ratelimiter, in which case this log from init can be
         // helpful.
@@ -1496,28 +1515,69 @@ static void ProcessBootconfig() {
     });
 }
 
-static std::string GenerateSpoofedBootDigest() {
-    static constexpr char kHex[] = "0123456789abcdef";
-    uint8_t digest[32];
-    if (TEMP_FAILURE_RETRY(getrandom(digest, sizeof(digest), 0)) != sizeof(digest)) {
-        PLOG(FATAL) << "getrandom failed for spoofed vbmeta digest";
+// Partition size of the vbmeta used for this slot. Published after boot so it
+// can replace a bootloader value; ro.boot.vbmeta.* is not write-once.
+static std::string GetVbmetaSize() {
+    std::string suffix = android::base::GetProperty("ro.boot.slot_suffix", "");
+    if (suffix.empty()) {
+        LOG(INFO) << "GetVbmetaSize: ro.boot.slot_suffix is empty";
     }
 
-    std::string hex(sizeof(digest) * 2, '\0');
-    for (size_t i = 0; i < sizeof(digest); ++i) {
-        hex[i * 2] = kHex[digest[i] >> 4];
-        hex[i * 2 + 1] = kHex[digest[i] & 0x0f];
+    std::string path = "/dev/block/by-name/vbmeta" + suffix;
+    LOG(INFO) << "GetVbmetaSize: Attempting to open " << path;
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "GetVbmetaSize: Failed to open " << path << ": " << strerror(errno);
+        return "";
     }
-    return hex;
+
+    uint64_t size = 0;
+    if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
+        LOG(ERROR) << "GetVbmetaSize: ioctl(BLKGETSIZE64) failed for " << path << ": "
+                   << strerror(errno);
+        off_t seek_size = lseek(fd, 0, SEEK_END);
+        if (seek_size < 0) {
+            LOG(ERROR) << "GetVbmetaSize: lseek failed for " << path << ": " << strerror(errno);
+            close(fd);
+            return "";
+        }
+        size = static_cast<uint64_t>(seek_size);
+    }
+
+    close(fd);
+
+    LOG(INFO) << "GetVbmetaSize: Size of " << path << ": " << size;
+    return std::to_string(size);
 }
 
-// ro.boot.* is write-once, so publish these before bootconfig and kernel cmdline
-// import. Framework attestation reads the digest properties from here.
+static void LoadVbMetaOverrides() {
+    uint32_t res;
+    std::string error;
+    std::string vbmeta_size = GetVbmetaSize();
+    if (!vbmeta_size.empty()) {
+        res = PropertySetNoSocket("ro.boot.vbmeta.size", vbmeta_size, &error);
+        if (res == PROP_SUCCESS) {
+            LOG(INFO) << "GetVbmetaSize: Property 'ro.boot.vbmeta.size' set successfully to '"
+                      << vbmeta_size << "'";
+        } else {
+            LOG(ERROR) << "GetVbmetaSize: Failed to set property 'ro.boot.vbmeta.size' to '"
+                       << vbmeta_size << "': err=" << res << " (" << error << ")";
+        }
+    } else {
+        LOG(INFO) << "GetVbmetaSize: Failed to get vbmeta size";
+    }
+}
+
+// ro.boot.* is write-once. Lock state is published before bootconfig so the
+// bootloader cannot override it. The vbmeta digest is left for the bootloader;
+// ro.boot.vbmeta.* can still be replaced later.
 static void SetVerifiedBootProps() {
     InitPropertyForceSet("ro.boot.flash.locked", "1");
-    InitPropertyForceSet("ro.boot.vbmeta.digest", GenerateSpoofedBootDigest());
-    InitPropertyForceSet("ro.boot.vbmeta.public_key_digest", GenerateSpoofedBootDigest());
     InitPropertyForceSet("ro.boot.vbmeta.device_state", "locked");
+    InitPropertyForceSet("ro.boot.vbmeta.hash_alg", "sha256");
+    InitPropertyForceSet("ro.boot.vbmeta.avb_version", "1.0");
+    InitPropertyForceSet("ro.boot.vbmeta.invalidate_on_error", "yes");
     InitPropertyForceSet("ro.boot.verifiedbootstate", "green");
     InitPropertyForceSet("ro.boot.veritymode", "enforcing");
     InitPropertyForceSet("ro.boot.warranty_bit", "0");
@@ -1586,6 +1646,11 @@ static void HandleInitSocket() {
                 // Always enable usb adb if device is booted with debug ramdisk.
                 update_sys_usb_config();
             }
+
+            weaken_prop_override_security = true;
+            LoadVbMetaOverrides();
+            weaken_prop_override_security = false;
+
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
             break;
